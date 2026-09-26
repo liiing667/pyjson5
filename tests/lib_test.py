@@ -854,5 +854,296 @@ class TestDumps(unittest.TestCase):
         self.assertEqual(json5.dumps({'': 'value'}), '{"": "value"}')
 
 
+class TestStrictSwitchBehavior(unittest.TestCase):
+    """Pins down what strict=True/False actually change today.
+
+    Current behavior (verified against the implementation): the `strict`
+    flag only controls whether literal line terminators (\\n, \\r) may
+    appear unescaped inside strings. It has no effect on unterminated
+    strings, single-quoted strings, or trailing commas.
+    """
+
+    maxDiff = None
+
+    def test_unterminated_string_fails_in_both_modes(self):
+        # An unterminated string is a hard syntax error regardless of
+        # strict; the message and position are identical in both modes.
+        for strict in (True, False):
+            with self.assertRaises(ValueError) as ctx:
+                json5.loads('"abc', strict=strict)
+            self.assertEqual(
+                '<string>:1 Unexpected end of input at column 5',
+                str(ctx.exception),
+            )
+
+        # Same for an unterminated single-quoted string.
+        for strict in (True, False):
+            with self.assertRaises(ValueError) as ctx:
+                json5.loads("'abc", strict=strict)
+            self.assertEqual(
+                '<string>:1 Unexpected end of input at column 5',
+                str(ctx.exception),
+            )
+
+        # strict=False does not rescue a string that runs into end of
+        # input, even across a newline.
+        with self.assertRaises(ValueError) as ctx:
+            json5.loads('"a\nb', strict=False)
+        self.assertEqual(
+            '<string>:2 Unexpected end of input at column 2',
+            str(ctx.exception),
+        )
+
+    def test_single_quoted_strings_allowed_in_both_modes(self):
+        # Single quotes are legal JSON5 in both modes; strict does not
+        # gate them.
+        self.assertEqual(json5.loads("'abc'", strict=True), 'abc')
+        self.assertEqual(json5.loads("'abc'", strict=False), 'abc')
+
+    def test_trailing_commas_allowed_in_both_modes(self):
+        # Trailing commas in arrays and objects are legal JSON5 in both
+        # modes; strict does not gate them.
+        for strict in (True, False):
+            self.assertEqual(json5.loads('[1, 2,]', strict=strict), [1, 2])
+            self.assertEqual(
+                json5.loads('{a: 1,}', strict=strict), {'a': 1}
+            )
+
+    def test_literal_newline_in_string_is_what_strict_gates(self):
+        # This is the one thing strict actually changes: a literal
+        # newline inside a string is rejected with strict=True and
+        # accepted with strict=False.
+        s = '"a\nb"'
+        with self.assertRaises(ValueError) as ctx:
+            json5.loads(s, strict=True)
+        self.assertEqual(
+            '<string>:1 Unexpected "\n" at column 3', str(ctx.exception)
+        )
+        self.assertEqual(json5.loads(s, strict=False), 'a\nb')
+
+        # Same for a carriage return.
+        self.assertEqual(json5.loads('"a\rb"', strict=False), 'a\rb')
+
+    def test_other_control_characters_ignore_strict(self):
+        # DISCREPANCY (implementation looks wrong, expectation would be
+        # the opposite): one would expect strict=True to reject all
+        # unescaped control characters (U+0000-U+001F) in strings, per
+        # the JSON5 spec. In fact raw \\t and \\x01 are accepted in BOTH
+        # modes; only line terminators are gated by strict. These
+        # assertions pin the current (permissive) behavior.
+        self.assertEqual(json5.loads('"a\tb"', strict=True), 'a\tb')
+        self.assertEqual(json5.loads('"\x01"', strict=True), '\x01')
+
+        # Conversely, a raw U+2028 (line separator) is REJECTED in both
+        # modes, even though strict=False accepts \\n and \\r. The
+        # grammar's non-strict escape hatch only covers U+0000-U+001F,
+        # so U+2028/U+2029 can never appear literally in a string.
+        for strict in (True, False):
+            with self.assertRaises(ValueError):
+                json5.loads('"\u2028"', strict=strict)
+
+
+class TestAllowDuplicateKeysBehavior(unittest.TestCase):
+    """Pins down allow_duplicate_keys=False on nested objects.
+
+    Current behavior: nested duplicates ARE caught, but only the first
+    duplicate encountered (depth-first) is reported, and the error
+    carries no position information at all.
+    """
+
+    maxDiff = None
+
+    def test_error_message_has_no_position(self):
+        # DISCREPANCY (implementation is at fault): every other parse
+        # error includes '<string>:LINE ... at column COL', but the
+        # duplicate-key error is raised after parsing, during AST
+        # conversion, so all location information is lost. For a
+        # hundreds-of-lines config file the user gets no hint where the
+        # duplicate is. Assertion pins the current bare message.
+        with self.assertRaises(ValueError) as ctx:
+            json5.loads('{a: 1, a: 2}', allow_duplicate_keys=False)
+        self.assertEqual(
+            'Duplicate key "a" found in object', str(ctx.exception)
+        )
+
+    def test_nested_duplicates_are_caught(self):
+        # Duplicates inside nested objects are rejected, not just
+        # top-level ones.
+        with self.assertRaises(ValueError) as ctx:
+            json5.loads(
+                '{x: {b: 1, b: 2}, y: 3}', allow_duplicate_keys=False
+            )
+        self.assertEqual(
+            'Duplicate key "b" found in object', str(ctx.exception)
+        )
+
+        # Duplicates inside objects nested in arrays are caught, too.
+        with self.assertRaises(ValueError):
+            json5.loads(
+                '[{k: 1, k: 2}, {k: 3, k: 4}]', allow_duplicate_keys=False
+            )
+
+    def test_only_the_first_duplicate_is_reported(self):
+        # The check raises on the first duplicate it walks into and
+        # aborts; it does not collect or report the remaining ones.
+        # Two duplicates in the same object: only "a" is reported.
+        with self.assertRaises(ValueError) as ctx:
+            json5.loads(
+                '{a: 1, a: 2, b: 3, b: 4}', allow_duplicate_keys=False
+            )
+        self.assertEqual(
+            'Duplicate key "a" found in object', str(ctx.exception)
+        )
+
+        # Duplicates in two sibling nested objects: a single error for
+        # the first object walked, the second object's duplicate is
+        # never reported.
+        with self.assertRaises(ValueError) as ctx:
+            json5.loads(
+                '{p: {k: 1, k: 2}, q: {k: 3, k: 4}}',
+                allow_duplicate_keys=False,
+            )
+        self.assertEqual(
+            'Duplicate key "k" found in object', str(ctx.exception)
+        )
+
+    def test_parse_position_on_duplicate_key_error(self):
+        # DISCREPANCY (implementation is at fault): parse()'s docstring
+        # says that on error, position is "the zero-based farthest
+        # offset into the string where the parser hit an error". For a
+        # duplicate-key failure there is no parse error, so position is
+        # instead one past the end of the successfully parsed value
+        # (12 == len('{a: 1, a: 2}')), exactly as if the parse had
+        # succeeded. It does NOT point at the duplicate key (the second
+        # "a" is at offset 7), so callers cannot use it to locate the
+        # problem.
+        val, err, pos = json5.parse(
+            '{a: 1, a: 2}', allow_duplicate_keys=False
+        )
+        self.assertIsNone(val)
+        self.assertEqual('Duplicate key "a" found in object', err)
+        self.assertEqual(12, pos)
+
+        # Same story for a nested duplicate: pos is one past the '}',
+        # not near the inner duplicate at all.
+        val, err, pos = json5.parse(
+            '{x: {b: 1, b: 2}}', allow_duplicate_keys=False
+        )
+        self.assertIsNone(val)
+        self.assertEqual('Duplicate key "b" found in object', err)
+        self.assertEqual(17, pos)
+
+        # consume_trailing=False does not change this: pos is still one
+        # past the value, and trailing junk is never even looked at.
+        val, err, pos = json5.parse(
+            '{a: 1, a: 2} junk',
+            allow_duplicate_keys=False,
+            consume_trailing=False,
+        )
+        self.assertIsNone(val)
+        self.assertEqual('Duplicate key "a" found in object', err)
+        self.assertEqual(12, pos)
+
+
+class TestConsumeTrailingBehavior(unittest.TestCase):
+    """Pins down where parsing resumes with consume_trailing=False.
+
+    Current behavior: on success, position is the zero-based index one
+    past the last character of the value, i.e. the index at which the
+    next parse() call should start. Whitespace and comments between
+    values are skipped by the *next* call, not the current one.
+    """
+
+    maxDiff = None
+
+    def test_position_is_the_resume_index(self):
+        s = '[1, 2] [3]'
+        val, err, pos = json5.parse(s, consume_trailing=False)
+        self.assertEqual([1, 2], val)
+        self.assertIsNone(err)
+        # pos points at the space right after ']'; the remainder of the
+        # string is readable from there.
+        self.assertEqual(6, pos)
+        self.assertEqual(' [3]', s[pos:])
+
+        # Resuming with start=pos parses the next value; leading
+        # whitespace is skipped by the next call itself.
+        val, err, pos = json5.parse(s, consume_trailing=False, start=pos)
+        self.assertEqual([3], val)
+        self.assertIsNone(err)
+        self.assertEqual(10, pos)
+        self.assertEqual('', s[pos:])
+
+    def test_comments_between_values_are_skipped_by_next_call(self):
+        s = '[1,2]// c\n[3]'
+        val, err, pos = json5.parse(s, consume_trailing=False)
+        self.assertEqual([1, 2], val)
+        self.assertIsNone(err)
+        # pos is right after ']', before the comment.
+        self.assertEqual(5, pos)
+        self.assertEqual('// c\n[3]', s[pos:])
+
+        # The comment is treated as whitespace by the next call.
+        val, err, pos = json5.parse(s, consume_trailing=False, start=pos)
+        self.assertEqual([3], val)
+        self.assertIsNone(err)
+        self.assertEqual(13, pos)
+
+    def test_trailing_whitespace_is_not_consumed(self):
+        # With consume_trailing=False, pos stops right after the value
+        # even if only whitespace follows.
+        val, err, pos = json5.parse('{a:1}   ', consume_trailing=False)
+        self.assertEqual({'a': 1}, val)
+        self.assertIsNone(err)
+        self.assertEqual(5, pos)
+
+    def test_incomplete_value_still_fails(self):
+        # consume_trailing=False does not rescue an unterminated value:
+        # '{a: 1, a: 2' has no valid prefix, so this is an error and
+        # pos is the error offset (end of input), not a resume point.
+        val, err, pos = json5.parse('{a: 1, a: 2', consume_trailing=False)
+        self.assertIsNone(val)
+        self.assertEqual(
+            '<string>:1 Unexpected end of input at column 12', err
+        )
+        self.assertEqual(11, pos)
+
+    def test_error_position_vs_success_position(self):
+        # Pins down the two different meanings position has, which is
+        # the source of the "sometimes at the value end, sometimes at
+        # the error" confusion:
+        #   - success: pos is one past the value (a resume index);
+        #   - syntax error: pos is the zero-based offset of the
+        #     offending character (errpos);
+        #   - duplicate-key error: pos is one past the value, as if the
+        #     parse had succeeded (see TestAllowDuplicateKeysBehavior).
+        val, err, pos = json5.parse('4 x')
+        self.assertIsNone(val)
+        self.assertEqual('<string>:1 Unexpected "x" at column 3', err)
+        self.assertEqual(2, pos)  # offset of the 'x' itself
+
+        val, err, pos = json5.parse('4 x', consume_trailing=False)
+        self.assertEqual(4, val)
+        self.assertIsNone(err)
+        self.assertEqual(1, pos)  # one past the '4'
+
+    def test_null_parses_to_none_with_no_error(self):
+        # GOTCHA (documentation is at fault): with consume_trailing=False
+        # a keyword only needs to match a prefix of the remaining text,
+        # so 'nullx' parses as `null` leaving 'x' unread. The returned
+        # value is None with err=None, so callers must check `err`, not
+        # the value, to detect failure -- the `if v:` loop in parse()'s
+        # own docstring would silently drop null/false/0 values.
+        val, err, pos = json5.parse('nullx', consume_trailing=False)
+        self.assertIsNone(val)
+        self.assertIsNone(err)
+        self.assertEqual(4, pos)
+
+        val, err, pos = json5.parse('truely', consume_trailing=False)
+        self.assertEqual(True, val)
+        self.assertIsNone(err)
+        self.assertEqual(4, pos)
+
+
 if __name__ == '__main__':  # pragma: no cover
     unittest.main()
